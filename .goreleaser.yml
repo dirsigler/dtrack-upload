@@ -70,6 +70,7 @@ brews:
   - repository:
       owner: dirsigler
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: "https://github.com/dirsigler/dtrack-upload"
     description: "Minimal CLI to upload CycloneDX SBOMs to Dependency Track"
     license: "Apache-2.0"
