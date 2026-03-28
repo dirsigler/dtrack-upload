@@ -1,0 +1,85 @@
+project_name: dtrack-upload
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - main: ./cmd
+    binary: dtrack-upload
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}}
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dirsigler/dtrack-upload"
+    goarch: amd64
+
+  - image_templates:
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source=https://github.com/dirsigler/dtrack-upload"
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-amd64"
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/dirsigler/dtrack-upload:latest"
+    image_templates:
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-amd64"
+      - "ghcr.io/dirsigler/dtrack-upload:{{ .Version }}-arm64"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - repository:
+      owner: dirsigler
+      name: homebrew-tap
+    homepage: "https://github.com/dirsigler/dtrack-upload"
+    description: "Minimal CLI to upload CycloneDX SBOMs to Dependency Track"
+    license: "Apache-2.0"
+    test: |
+      system "#{bin}/dtrack-upload", "--version"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"

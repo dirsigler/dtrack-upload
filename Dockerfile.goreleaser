@@ -1,0 +1,13 @@
+# GoReleaser copies the pre-built binary into the image.
+# See .goreleaser.yml for build configuration.
+FROM gcr.io/distroless/static:nonroot
+
+LABEL org.opencontainers.image.source="https://github.com/dirsigler/dtrack-upload"
+LABEL org.opencontainers.image.description="Minimal CLI to upload CycloneDX SBOMs to Dependency Track"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+COPY dtrack-upload /dtrack-upload
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/dtrack-upload"]
