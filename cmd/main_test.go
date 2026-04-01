@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -82,16 +83,16 @@ func TestAPIError(t *testing.T) {
 	}
 
 	var target *apiError
-	if !isAPIError(err, &target) {
-		t.Error("isAPIError should return true for *apiError")
+	if !errors.As(err, &target) {
+		t.Error("errors.As should match *apiError")
 	}
 	if target.StatusCode != 409 {
 		t.Errorf("target.StatusCode = %d, want 409", target.StatusCode)
 	}
 
 	plainErr := io.EOF
-	if isAPIError(plainErr, &target) {
-		t.Error("isAPIError should return false for non-apiError")
+	if errors.As(plainErr, &target) {
+		t.Error("errors.As should not match io.EOF as *apiError")
 	}
 }
 
@@ -430,12 +431,25 @@ func TestRun_FullIntegration(t *testing.T) {
 		t.Error("expected upload token in output")
 	}
 
-	// Verify 4 projects were created
+	// Verify 4 projects: 3 parents + 1 leaf with qualified name
 	mock.mu.Lock()
 	count := len(mock.projects)
 	mock.mu.Unlock()
 	if count != 4 {
 		t.Errorf("expected 4 projects, got %d", count)
+	}
+
+	// Verify leaf project has qualified name (full path)
+	mock.mu.Lock()
+	var leafFound bool
+	for _, p := range mock.projects {
+		if p.Name == "pipeline/my-org/my-app/source" && p.Version == "42" {
+			leafFound = true
+		}
+	}
+	mock.mu.Unlock()
+	if !leafFound {
+		t.Error("expected leaf project named 'pipeline/my-org/my-app/source' v42")
 	}
 
 	// Run again — should be idempotent
@@ -451,6 +465,87 @@ func TestRun_FullIntegration(t *testing.T) {
 	mock.mu.Unlock()
 	if count != 4 {
 		t.Errorf("expected 4 projects after re-run, got %d", count)
+	}
+}
+
+func TestRun_TwoLevelAppCentric(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+
+	sbom := `{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[]}`
+	tmpFile := filepath.Join(t.TempDir(), "test.cdx.json")
+	_ = os.WriteFile(tmpFile, []byte(sbom), 0o644)
+
+	// Simulate: dtrack-upload --project-path "my-app/source" --project-version 42
+	cfg := &config{
+		BaseURL:        mock.server.URL,
+		APIKey:         "test-key",
+		ProjectPath:    "my-app/source",
+		ProjectVersion: "42",
+		SBOMFile:       tmpFile,
+		Tags:           "origin:pipeline-source,app:my-app",
+		Classifier:     "APPLICATION",
+	}
+
+	logw := &bytes.Buffer{}
+	if err := run(cfg, logw); err != nil {
+		t.Fatalf("run source: %v\nlog: %s", err, logw.String())
+	}
+
+	// Also upload container SBOM
+	cfg2 := &config{
+		BaseURL:        mock.server.URL,
+		APIKey:         "test-key",
+		ProjectPath:    "my-app/container",
+		ProjectVersion: "42",
+		SBOMFile:       tmpFile,
+		Tags:           "origin:pipeline-container,app:my-app",
+		Classifier:     "APPLICATION",
+	}
+
+	logw.Reset()
+	if err := run(cfg2, logw); err != nil {
+		t.Fatalf("run container: %v\nlog: %s", err, logw.String())
+	}
+
+	// Verify: 1 parent + 2 leaves = 3 projects
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	if len(mock.projects) != 3 {
+		t.Errorf("expected 3 projects, got %d", len(mock.projects))
+		for _, p := range mock.projects {
+			t.Logf("  %s v%s (uuid=%s)", p.Name, p.Version, p.UUID)
+		}
+	}
+
+	// Verify parent has no version
+	var parentFound, sourceFound, containerFound bool
+	for _, p := range mock.projects {
+		switch {
+		case p.Name == "my-app" && p.Version == "":
+			parentFound = true
+		case p.Name == "my-app/source" && p.Version == "42":
+			sourceFound = true
+			if p.Parent == nil {
+				t.Error("source leaf has no parent")
+			}
+		case p.Name == "my-app/container" && p.Version == "42":
+			containerFound = true
+			if p.Parent == nil {
+				t.Error("container leaf has no parent")
+			}
+		}
+	}
+
+	if !parentFound {
+		t.Error("expected parent project 'my-app'")
+	}
+	if !sourceFound {
+		t.Error("expected leaf project 'my-app/source' v42")
+	}
+	if !containerFound {
+		t.Error("expected leaf project 'my-app/container' v42")
 	}
 }
 

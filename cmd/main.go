@@ -3,25 +3,25 @@
 //
 // Usage:
 //
-//	dtrack-upload --project-path "pipeline/my-org/my-app/source" \
+//	dtrack-upload --project-path "my-app/source" \
 //	  --project-version "42" \
 //	  --sbom sbom.cdx.json
 //
-// The project path is split on "/" and each segment becomes a nested project
-// in Dependency Track. The SBOM is uploaded to the leaf project.
+// The project path is split on "/". All segments except the last create the
+// parent hierarchy. The leaf project uses the full path as its name to
+// guarantee global uniqueness in Dependency Track.
 //
-// Example: --project-path "pipeline/my-org/my-app/source" creates:
+// Example: --project-path "my-app/source" creates:
 //
-//	pipeline/
-//	  my-org/
-//	    my-app/
-//	      source (v42) ← SBOM uploaded here
+//	my-app/                      (parent, no version)
+//	  my-app/source  (v42)       ← SBOM uploaded here
 package main
 
 import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -124,7 +124,7 @@ func parseFlags(args []string) (*config, error) {
 
 	fs.StringVar(&cfg.BaseURL, "url", "", "Dependency Track API base URL (or DEPENDENCY_TRACK_URL env)")
 	fs.StringVar(&cfg.APIKey, "api-key", "", "Dependency Track API key (or DEPENDENCY_TRACK_API_KEY env)")
-	fs.StringVar(&cfg.ProjectPath, "project-path", "", "Slash-separated project hierarchy (e.g. pipeline/my-org/my-app/source)")
+	fs.StringVar(&cfg.ProjectPath, "project-path", "", "Slash-separated project path (e.g. my-app/source). Parent hierarchy is created from all segments except the last; the full path becomes the leaf project name.")
 	fs.StringVar(&cfg.ProjectVersion, "project-version", "", "Version for the leaf project")
 	fs.StringVar(&cfg.SBOMFile, "sbom", "", "Path to CycloneDX SBOM file")
 	fs.StringVar(&cfg.Tags, "tags", "", "Comma-separated tags for the leaf project (e.g. origin:pipeline,team:platform)")
@@ -168,31 +168,37 @@ func run(cfg *config, logw io.Writer) error {
 
 	client := newDTClient(cfg.BaseURL, cfg.APIKey, cfg.Insecure)
 
-	// Create project hierarchy
+	// Create parent hierarchy (all segments except the last).
 	var parentUUID string
-	for i, segment := range segments {
-		isLeaf := i == len(segments)-1
-		uuid, err := client.ensureProject(logw, segment, parentUUID, isLeaf, cfg.ProjectVersion, cfg.Classifier)
+	for _, segment := range segments[:len(segments)-1] {
+		uuid, err := client.ensureProject(logw, segment, parentUUID, false, "", cfg.Classifier)
 		if err != nil {
 			return fmt.Errorf("failed to ensure project %q: %w", segment, err)
 		}
 		parentUUID = uuid
 	}
 
+	// Create the leaf project using the full path as its name.
+	// This guarantees global uniqueness in DT (e.g. "my-app/source" not just "source").
+	leafName := strings.Join(segments, "/")
+	leafUUID, err := client.ensureProject(logw, leafName, parentUUID, true, cfg.ProjectVersion, cfg.Classifier)
+	if err != nil {
+		return fmt.Errorf("failed to ensure project %q: %w", leafName, err)
+	}
+
 	// Set tags on the leaf project
 	if cfg.Tags != "" {
 		tags := parseTags(cfg.Tags)
-		if err := client.setProjectTags(parentUUID, tags); err != nil {
+		if err := client.setProjectTags(leafUUID, tags); err != nil {
 			fmt.Fprintf(logw, "Warning: failed to set tags: %v\n", err)
 		}
 	}
 
 	// Upload SBOM
-	leafName := segments[len(segments)-1]
 	fmt.Fprintf(logw, "Uploading SBOM %s to project %s v%s (UUID: %s)...\n",
-		filepath.Base(cfg.SBOMFile), leafName, cfg.ProjectVersion, parentUUID)
+		filepath.Base(cfg.SBOMFile), leafName, cfg.ProjectVersion, leafUUID)
 
-	token, err := client.uploadBOM(parentUUID, cfg.SBOMFile)
+	token, err := client.uploadBOM(leafUUID, cfg.SBOMFile)
 	if err != nil {
 		return fmt.Errorf("failed to upload SBOM: %w", err)
 	}
@@ -262,7 +268,7 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 	created, err := c.createProject(&newProject)
 	if err != nil {
 		var apiErr *apiError
-		if isAPIError(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
 			return c.handleConflict(logw, name, parentUUID, isLeaf, version, classifier)
 		}
 		return "", fmt.Errorf("create project: %w", err)
@@ -503,16 +509,3 @@ func (c *dtClient) doRequest(method, reqURL string, body io.Reader) ([]byte, err
 	return respBody, nil
 }
 
-// isAPIError extracts an *apiError from an error chain.
-func isAPIError(err error, target **apiError) bool {
-	var ae *apiError
-	if ok := false; err != nil {
-		// Simple type assertion since we don't use error wrapping for apiError
-		ae, ok = err.(*apiError)
-		if ok {
-			*target = ae
-			return true
-		}
-	}
-	return false
-}
