@@ -47,18 +47,20 @@ type config struct {
 	ProjectVersion string
 	SBOMFile       string
 	Tags           string
-	Classifier     string
-	Insecure       bool
+	Classifier              string
+	AggregateChildVulns     bool
+	Insecure                bool
 }
 
 // project represents a Dependency Track project.
 type project struct {
-	UUID       string   `json:"uuid,omitempty"`
-	Name       string   `json:"name"`
-	Version    string   `json:"version,omitempty"`
-	Active     bool     `json:"active"`
-	Parent     *project `json:"parent,omitempty"`
-	Classifier string   `json:"classifier,omitempty"`
+	UUID            string   `json:"uuid,omitempty"`
+	Name            string   `json:"name"`
+	Version         string   `json:"version,omitempty"`
+	Active          bool     `json:"active"`
+	Parent          *project `json:"parent,omitempty"`
+	Classifier      string   `json:"classifier,omitempty"`
+	CollectionLogic string   `json:"collectionLogic,omitempty"`
 }
 
 // tag represents a Dependency Track project tag.
@@ -129,6 +131,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.SBOMFile, "sbom", "", "Path to CycloneDX SBOM file")
 	fs.StringVar(&cfg.Tags, "tags", "", "Comma-separated tags for the leaf project (e.g. origin:pipeline,team:platform)")
 	fs.StringVar(&cfg.Classifier, "classifier", "APPLICATION", "DT project classifier (APPLICATION, LIBRARY, etc.)")
+	fs.BoolVar(&cfg.AggregateChildVulns, "aggregate-child-vulns", true, "Set parent projects to aggregate vulnerabilities from direct children")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "Skip TLS certificate verification")
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 
@@ -168,10 +171,16 @@ func run(cfg *config, logw io.Writer) error {
 
 	client := newDTClient(cfg.BaseURL, cfg.APIKey, cfg.Insecure)
 
+	// Determine collection logic for parent projects.
+	collectionLogic := "AGGREGATE_DIRECT_CHILDREN"
+	if !cfg.AggregateChildVulns {
+		collectionLogic = "NONE"
+	}
+
 	// Create parent hierarchy (all segments except the last).
 	var parentUUID string
 	for _, segment := range segments[:len(segments)-1] {
-		uuid, err := client.ensureProject(logw, segment, parentUUID, false, "", cfg.Classifier)
+		uuid, err := client.ensureProject(logw, segment, parentUUID, false, "", cfg.Classifier, collectionLogic)
 		if err != nil {
 			return fmt.Errorf("failed to ensure project %q: %w", segment, err)
 		}
@@ -181,7 +190,7 @@ func run(cfg *config, logw io.Writer) error {
 	// Create the leaf project using the full path as its name.
 	// This guarantees global uniqueness in DT (e.g. "my-app/source" not just "source").
 	leafName := strings.Join(segments, "/")
-	leafUUID, err := client.ensureProject(logw, leafName, parentUUID, true, cfg.ProjectVersion, cfg.Classifier)
+	leafUUID, err := client.ensureProject(logw, leafName, parentUUID, true, cfg.ProjectVersion, cfg.Classifier, "")
 	if err != nil {
 		return fmt.Errorf("failed to ensure project %q: %w", leafName, err)
 	}
@@ -230,7 +239,7 @@ func parseTags(tagStr string) []tag {
 	return tags
 }
 
-func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier string) (string, error) {
+func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier, collectionLogic string) (string, error) {
 	// For leaf projects, try exact name+version lookup first
 	if isLeaf && version != "" {
 		p, err := c.lookupProject(name, version)
@@ -254,9 +263,10 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 
 	// Create project
 	newProject := project{
-		Name:       name,
-		Active:     true,
-		Classifier: classifier,
+		Name:            name,
+		Active:          true,
+		Classifier:      classifier,
+		CollectionLogic: collectionLogic,
 	}
 	if parentUUID != "" {
 		newProject.Parent = &project{UUID: parentUUID}
@@ -269,7 +279,7 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 	if err != nil {
 		var apiErr *apiError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
-			return c.handleConflict(logw, name, parentUUID, isLeaf, version, classifier)
+			return c.handleConflict(logw, name, parentUUID, isLeaf, version, classifier, collectionLogic)
 		}
 		return "", fmt.Errorf("create project: %w", err)
 	}
@@ -304,7 +314,7 @@ func (c *dtClient) findByParent(logw io.Writer, name, parentUUID string) (string
 }
 
 // handleConflict resolves a 409 by finding the right project or creating a disambiguated one.
-func (c *dtClient) handleConflict(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier string) (string, error) {
+func (c *dtClient) handleConflict(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier, collectionLogic string) (string, error) {
 	// Try to find one with matching parent
 	if uuid, found := c.findByParent(logw, name, parentUUID); found {
 		return uuid, nil
@@ -314,11 +324,12 @@ func (c *dtClient) handleConflict(logw io.Writer, name, parentUUID string, isLea
 	// that collide, add a disambiguating version derived from the parent UUID.
 	if !isLeaf && parentUUID != "" {
 		disambiguated := &project{
-			Name:       name,
-			Version:    parentUUID[:8],
-			Active:     true,
-			Classifier: classifier,
-			Parent:     &project{UUID: parentUUID},
+			Name:            name,
+			Version:         parentUUID[:8],
+			Active:          true,
+			Classifier:      classifier,
+			CollectionLogic: collectionLogic,
+			Parent:          &project{UUID: parentUUID},
 		}
 		created, err := c.createProject(disambiguated)
 		if err != nil {

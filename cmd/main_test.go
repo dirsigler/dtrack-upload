@@ -237,7 +237,7 @@ func TestEnsureProject_CreatesHierarchy(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create pipeline -> org -> app
-	uuid1, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION")
+	uuid1, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("create pipeline: %v", err)
 	}
@@ -245,12 +245,12 @@ func TestEnsureProject_CreatesHierarchy(t *testing.T) {
 		t.Fatal("pipeline UUID is empty")
 	}
 
-	uuid2, err := client.ensureProject(logw, "org", uuid1, false, "", "APPLICATION")
+	uuid2, err := client.ensureProject(logw, "org", uuid1, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 
-	uuid3, err := client.ensureProject(logw, "app", uuid2, true, "v1", "APPLICATION")
+	uuid3, err := client.ensureProject(logw, "app", uuid2, true, "v1", "APPLICATION", "")
 	if err != nil {
 		t.Fatalf("create app: %v", err)
 	}
@@ -272,6 +272,20 @@ func TestEnsureProject_CreatesHierarchy(t *testing.T) {
 	if leaf.Parent == nil || leaf.Parent.UUID != uuid2 {
 		t.Errorf("leaf parent = %v, want UUID %s", leaf.Parent, uuid2)
 	}
+
+	// Verify parent projects have CollectionLogic set
+	pipeline := mock.projects[uuid1]
+	if pipeline.CollectionLogic != "AGGREGATE_DIRECT_CHILDREN" {
+		t.Errorf("pipeline collectionLogic = %q, want %q", pipeline.CollectionLogic, "AGGREGATE_DIRECT_CHILDREN")
+	}
+	org := mock.projects[uuid2]
+	if org.CollectionLogic != "AGGREGATE_DIRECT_CHILDREN" {
+		t.Errorf("org collectionLogic = %q, want %q", org.CollectionLogic, "AGGREGATE_DIRECT_CHILDREN")
+	}
+	// Verify leaf does NOT have CollectionLogic set
+	if leaf.CollectionLogic != "" {
+		t.Errorf("leaf collectionLogic = %q, want empty", leaf.CollectionLogic)
+	}
 }
 
 func TestEnsureProject_FindsExisting(t *testing.T) {
@@ -281,12 +295,12 @@ func TestEnsureProject_FindsExisting(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// First run — creates
-	uuid1, _ := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION")
-	uuid2, _ := client.ensureProject(logw, "app", uuid1, true, "v1", "APPLICATION")
+	uuid1, _ := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	uuid2, _ := client.ensureProject(logw, "app", uuid1, true, "v1", "APPLICATION", "")
 
 	// Second run — should find existing
 	logw.Reset()
-	uuid1b, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION")
+	uuid1b, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("find pipeline: %v", err)
 	}
@@ -294,7 +308,7 @@ func TestEnsureProject_FindsExisting(t *testing.T) {
 		t.Errorf("pipeline UUID changed: %s -> %s", uuid1, uuid1b)
 	}
 
-	uuid2b, err := client.ensureProject(logw, "app", uuid1b, true, "v1", "APPLICATION")
+	uuid2b, err := client.ensureProject(logw, "app", uuid1b, true, "v1", "APPLICATION", "")
 	if err != nil {
 		t.Fatalf("find app: %v", err)
 	}
@@ -314,19 +328,19 @@ func TestEnsureProject_ConflictHandling(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create "myname" at root level
-	_, err := client.ensureProject(logw, "myname", "", false, "", "APPLICATION")
+	_, err := client.ensureProject(logw, "myname", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("create root myname: %v", err)
 	}
 
 	// Create "parent"
-	parentUUID, err := client.ensureProject(logw, "parent", "", false, "", "APPLICATION")
+	parentUUID, err := client.ensureProject(logw, "parent", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
 	}
 
 	// Try to create "myname" under "parent" — should conflict then disambiguate
-	uuid, err := client.ensureProject(logw, "myname", parentUUID, false, "", "APPLICATION")
+	uuid, err := client.ensureProject(logw, "myname", parentUUID, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
 	if err != nil {
 		t.Fatalf("create myname under parent: %v", err)
 	}
@@ -383,7 +397,7 @@ func TestSetProjectTags(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create a project first
-	uuid, _ := client.ensureProject(logw, "tagged-app", "", true, "v1", "APPLICATION")
+	uuid, _ := client.ensureProject(logw, "tagged-app", "", true, "v1", "APPLICATION", "")
 
 	// Set tags
 	tags := parseTags("origin:pipeline,team:platform")
