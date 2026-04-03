@@ -32,6 +32,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var (
@@ -47,20 +49,27 @@ type config struct {
 	ProjectVersion string
 	SBOMFile       string
 	Tags           string
-	Classifier              string
-	AggregateChildVulns     bool
-	Insecure                bool
+	Classifier          string
+	AggregateChildVulns bool
+	Insecure            bool
+	Latest              bool
 }
 
 // project represents a Dependency Track project.
 type project struct {
-	UUID            string   `json:"uuid,omitempty"`
-	Name            string   `json:"name"`
-	Version         string   `json:"version,omitempty"`
-	Active          bool     `json:"active"`
-	Parent          *project `json:"parent,omitempty"`
-	Classifier      string   `json:"classifier,omitempty"`
-	CollectionLogic string   `json:"collectionLogic,omitempty"`
+	UUID            uuid.UUID  `json:"uuid,omitempty"`
+	Name            string     `json:"name"`
+	Version         string     `json:"version,omitempty"`
+	Active          bool       `json:"active"`
+	IsLatest        bool       `json:"isLatest,omitempty"`
+	Parent          *parentRef `json:"parent,omitempty"`
+	Classifier      string     `json:"classifier,omitempty"`
+	CollectionLogic string     `json:"collectionLogic,omitempty"`
+}
+
+// parentRef is a minimal reference used when setting a project's parent.
+type parentRef struct {
+	UUID uuid.UUID `json:"uuid"`
 }
 
 // tag represents a Dependency Track project tag.
@@ -133,6 +142,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.Classifier, "classifier", "APPLICATION", "DT project classifier (APPLICATION, LIBRARY, etc.)")
 	fs.BoolVar(&cfg.AggregateChildVulns, "aggregate-child-vulns", true, "Set parent projects to aggregate vulnerabilities from direct children")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "Skip TLS certificate verification")
+	fs.BoolVar(&cfg.Latest, "latest", true, "Mark this project version as latest in Dependency Track")
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -178,19 +188,19 @@ func run(cfg *config, logw io.Writer) error {
 	}
 
 	// Create parent hierarchy (all segments except the last).
-	var parentUUID string
+	var parentUUID uuid.UUID
 	for _, segment := range segments[:len(segments)-1] {
-		uuid, err := client.ensureProject(logw, segment, parentUUID, false, "", cfg.Classifier, collectionLogic)
+		id, err := client.ensureProject(logw, segment, parentUUID, false, "", cfg.Classifier, collectionLogic, false)
 		if err != nil {
 			return fmt.Errorf("failed to ensure project %q: %w", segment, err)
 		}
-		parentUUID = uuid
+		parentUUID = id
 	}
 
 	// Create the leaf project using the full path as its name.
 	// This guarantees global uniqueness in DT (e.g. "my-app/source" not just "source").
 	leafName := strings.Join(segments, "/")
-	leafUUID, err := client.ensureProject(logw, leafName, parentUUID, true, cfg.ProjectVersion, cfg.Classifier, "")
+	leafUUID, err := client.ensureProject(logw, leafName, parentUUID, true, cfg.ProjectVersion, cfg.Classifier, "", cfg.Latest)
 	if err != nil {
 		return fmt.Errorf("failed to ensure project %q: %w", leafName, err)
 	}
@@ -239,16 +249,29 @@ func parseTags(tagStr string) []tag {
 	return tags
 }
 
-func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier, collectionLogic string) (string, error) {
+func (c *dtClient) ensureProject(logw io.Writer, name string, parentUUID uuid.UUID, isLeaf bool, version, classifier, collectionLogic string, latest bool) (uuid.UUID, error) {
 	// For leaf projects, try exact name+version lookup first
 	if isLeaf && version != "" {
 		p, err := c.lookupProject(name, version)
 		if err == nil && p != nil {
-			if parentUUID != "" && (p.Parent == nil || p.Parent.UUID != parentUUID) {
+			needsUpdate := false
+
+			if parentUUID != uuid.Nil && (p.Parent == nil || p.Parent.UUID != parentUUID) {
 				fmt.Fprintf(logw, "Updating parent for existing project: %s v%s\n", name, version)
-				p.Parent = &project{UUID: parentUUID}
-				_ = c.updateProject(p)
+				p.Parent = &parentRef{UUID: parentUUID}
+				needsUpdate = true
 			}
+			if latest && !p.IsLatest {
+				fmt.Fprintf(logw, "Marking project as latest: %s v%s\n", name, version)
+				p.IsLatest = true
+				needsUpdate = true
+			}
+			if needsUpdate {
+				if err := c.patchProject(p.UUID, p); err != nil {
+					fmt.Fprintf(logw, "Warning: failed to update project: %v\n", err)
+				}
+			}
+
 			fmt.Fprintf(logw, "Found existing project: %s v%s (UUID: %s)\n", name, version, p.UUID)
 			return p.UUID, nil
 		}
@@ -256,8 +279,8 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 
 	// For parent projects, search by name and find one matching our parent.
 	if !isLeaf {
-		if uuid, found := c.findByParent(logw, name, parentUUID); found {
-			return uuid, nil
+		if id, found := c.findByParent(logw, name, parentUUID); found {
+			return id, nil
 		}
 	}
 
@@ -268,20 +291,21 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 		Classifier:      classifier,
 		CollectionLogic: collectionLogic,
 	}
-	if parentUUID != "" {
-		newProject.Parent = &project{UUID: parentUUID}
+	if parentUUID != uuid.Nil {
+		newProject.Parent = &parentRef{UUID: parentUUID}
 	}
 	if isLeaf && version != "" {
 		newProject.Version = version
+		newProject.IsLatest = latest
 	}
 
 	created, err := c.createProject(&newProject)
 	if err != nil {
 		var apiErr *apiError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
-			return c.handleConflict(logw, name, parentUUID, isLeaf, version, classifier, collectionLogic)
+			return c.handleConflict(logw, name, parentUUID, isLeaf, version, classifier, collectionLogic, latest)
 		}
-		return "", fmt.Errorf("create project: %w", err)
+		return uuid.Nil, fmt.Errorf("create project: %w", err)
 	}
 
 	fmt.Fprintf(logw, "Created project: %s (UUID: %s)\n", name, created.UUID)
@@ -290,10 +314,10 @@ func (c *dtClient) ensureProject(logw io.Writer, name, parentUUID string, isLeaf
 
 // findByParent searches for a project with the given name under the given parent.
 // The DT list endpoint omits parent info, so each candidate is fetched individually.
-func (c *dtClient) findByParent(logw io.Writer, name, parentUUID string) (string, bool) {
+func (c *dtClient) findByParent(logw io.Writer, name string, parentUUID uuid.UUID) (uuid.UUID, bool) {
 	projects, err := c.searchProjects(name)
 	if err != nil {
-		return "", false
+		return uuid.Nil, false
 	}
 
 	for _, p := range projects {
@@ -301,45 +325,45 @@ func (c *dtClient) findByParent(logw io.Writer, name, parentUUID string) (string
 		if err != nil {
 			continue
 		}
-		if parentUUID == "" && full.Parent == nil {
+		if parentUUID == uuid.Nil && full.Parent == nil {
 			fmt.Fprintf(logw, "Found existing project: %s (UUID: %s)\n", name, full.UUID)
 			return full.UUID, true
 		}
-		if parentUUID != "" && full.Parent != nil && full.Parent.UUID == parentUUID {
+		if parentUUID != uuid.Nil && full.Parent != nil && full.Parent.UUID == parentUUID {
 			fmt.Fprintf(logw, "Found existing project: %s (UUID: %s)\n", name, full.UUID)
 			return full.UUID, true
 		}
 	}
-	return "", false
+	return uuid.Nil, false
 }
 
 // handleConflict resolves a 409 by finding the right project or creating a disambiguated one.
-func (c *dtClient) handleConflict(logw io.Writer, name, parentUUID string, isLeaf bool, version, classifier, collectionLogic string) (string, error) {
+func (c *dtClient) handleConflict(logw io.Writer, name string, parentUUID uuid.UUID, isLeaf bool, version, classifier, collectionLogic string, latest bool) (uuid.UUID, error) {
 	// Try to find one with matching parent
-	if uuid, found := c.findByParent(logw, name, parentUUID); found {
-		return uuid, nil
+	if id, found := c.findByParent(logw, name, parentUUID); found {
+		return id, nil
 	}
 
 	// DT doesn't allow duplicate (name, version) pairs. For intermediate projects
 	// that collide, add a disambiguating version derived from the parent UUID.
-	if !isLeaf && parentUUID != "" {
+	if !isLeaf && parentUUID != uuid.Nil {
 		disambiguated := &project{
 			Name:            name,
-			Version:         parentUUID[:8],
+			Version:         parentUUID.String()[:8],
 			Active:          true,
 			Classifier:      classifier,
 			CollectionLogic: collectionLogic,
-			Parent:          &project{UUID: parentUUID},
+			Parent:          &parentRef{UUID: parentUUID},
 		}
 		created, err := c.createProject(disambiguated)
 		if err != nil {
-			return "", fmt.Errorf("create disambiguated project: %w", err)
+			return uuid.Nil, fmt.Errorf("create disambiguated project: %w", err)
 		}
 		fmt.Fprintf(logw, "Created project (disambiguated): %s (UUID: %s)\n", name, created.UUID)
 		return created.UUID, nil
 	}
 
-	return "", fmt.Errorf("project %q already exists and could not be matched to parent", name)
+	return uuid.Nil, fmt.Errorf("project %q already exists and could not be matched to parent", name)
 }
 
 // --- DT API methods ---
@@ -357,7 +381,7 @@ func (c *dtClient) lookupProject(name, version string) (*project, error) {
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, err
 	}
-	if p.UUID == "" {
+	if p.UUID == uuid.Nil {
 		return nil, nil
 	}
 	return &p, nil
@@ -379,8 +403,8 @@ func (c *dtClient) searchProjects(name string) ([]project, error) {
 	return projects, nil
 }
 
-func (c *dtClient) fetchProject(uuid string) (*project, error) {
-	body, err := c.doRequest(http.MethodGet, fmt.Sprintf("%s/project/%s", c.baseURL, uuid), nil)
+func (c *dtClient) fetchProject(id uuid.UUID) (*project, error) {
+	body, err := c.doRequest(http.MethodGet, fmt.Sprintf("%s/project/%s", c.baseURL, id), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -410,16 +434,18 @@ func (c *dtClient) createProject(p *project) (*project, error) {
 	return &created, nil
 }
 
-func (c *dtClient) updateProject(p *project) error {
+// patchProject sends a PATCH request to partially update a project,
+// avoiding overwrites of fields not included in the payload.
+func (c *dtClient) patchProject(id uuid.UUID, p *project) error {
 	payload, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	_, err = c.doRequest(http.MethodPost, c.baseURL+"/project", bytes.NewReader(payload))
+	_, err = c.doRequest(http.MethodPatch, fmt.Sprintf("%s/project/%s", c.baseURL, id), bytes.NewReader(payload))
 	return err
 }
 
-func (c *dtClient) setProjectTags(projectUUID string, tags []tag) error {
+func (c *dtClient) setProjectTags(projectUUID uuid.UUID, tags []tag) error {
 	full, err := c.fetchProject(projectUUID)
 	if err != nil {
 		return fmt.Errorf("fetch project: %w", err)
@@ -438,7 +464,7 @@ func (c *dtClient) setProjectTags(projectUUID string, tags []tag) error {
 	return err
 }
 
-func (c *dtClient) uploadBOM(projectUUID, sbomPath string) (string, error) {
+func (c *dtClient) uploadBOM(projectUUID uuid.UUID, sbomPath string) (string, error) {
 	f, err := os.Open(sbomPath)
 	if err != nil {
 		return "", fmt.Errorf("open SBOM file: %w", err)
@@ -448,7 +474,7 @@ func (c *dtClient) uploadBOM(projectUUID, sbomPath string) (string, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
-	if err := writer.WriteField("project", projectUUID); err != nil {
+	if err := writer.WriteField("project", projectUUID.String()); err != nil {
 		return "", err
 	}
 

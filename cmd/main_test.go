@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestParseSegments(t *testing.T) {
@@ -99,13 +100,13 @@ func TestAPIError(t *testing.T) {
 // mockDT is a fake Dependency Track API server for testing.
 type mockDT struct {
 	mu       sync.Mutex
-	projects map[string]*project // uuid -> project
+	projects map[uuid.UUID]*project
 	server   *httptest.Server
 }
 
 func newMockDT() *mockDT {
 	m := &mockDT{
-		projects: make(map[string]*project),
+		projects: make(map[uuid.UUID]*project),
 	}
 	mux := http.NewServeMux()
 
@@ -125,22 +126,7 @@ func newMockDT() *mockDT {
 		_ = json.NewEncoder(w).Encode(results)
 	})
 
-	// GET /api/v1/project/{uuid} — fetch by UUID (includes parent)
-	mux.HandleFunc("GET /api/v1/project/{uuid}", func(w http.ResponseWriter, r *http.Request) {
-		uuid := r.PathValue("uuid")
-		m.mu.Lock()
-		defer m.mu.Unlock()
-
-		p, ok := m.projects[uuid]
-		if !ok {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(p)
-	})
-
-	// GET /api/v1/project/lookup?name=X&version=Y — exact lookup
+	// GET /api/v1/project/lookup?name=X&version=Y — exact lookup (must be before /{uuid})
 	mux.HandleFunc("GET /api/v1/project/lookup", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
 		version := r.URL.Query().Get("version")
@@ -155,6 +141,25 @@ func newMockDT() *mockDT {
 			}
 		}
 		http.Error(w, "not found", http.StatusNotFound)
+	})
+
+	// GET /api/v1/project/{uuid} — fetch by UUID (includes parent)
+	mux.HandleFunc("GET /api/v1/project/{uuid}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("uuid"))
+		if err != nil {
+			http.Error(w, "invalid uuid", http.StatusBadRequest)
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		p, ok := m.projects[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(p)
 	})
 
 	// PUT /api/v1/project — create
@@ -177,14 +182,14 @@ func newMockDT() *mockDT {
 			}
 		}
 
-		p.UUID = fmt.Sprintf("uuid-%s-%s", p.Name, p.Version)
+		p.UUID = uuid.New()
 		m.projects[p.UUID] = &p
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(p)
 	})
 
-	// POST /api/v1/project — update
+	// POST /api/v1/project — full update
 	mux.HandleFunc("POST /api/v1/project", func(w http.ResponseWriter, r *http.Request) {
 		var p project
 		body, _ := io.ReadAll(r.Body)
@@ -196,16 +201,51 @@ func newMockDT() *mockDT {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
-		if existing, ok := m.projects[p.UUID]; ok {
-			existing.Parent = p.Parent
-			existing.Name = p.Name
-			existing.Version = p.Version
-			existing.Active = p.Active
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(existing)
+		existing, ok := m.projects[p.UUID]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, "not found", http.StatusNotFound)
+		existing.Parent = p.Parent
+		existing.Name = p.Name
+		existing.Version = p.Version
+		existing.Active = p.Active
+		existing.IsLatest = p.IsLatest
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(existing)
+	})
+
+	// PATCH /api/v1/project/{uuid} — partial update
+	mux.HandleFunc("PATCH /api/v1/project/{uuid}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := uuid.Parse(r.PathValue("uuid"))
+		if err != nil {
+			http.Error(w, "invalid uuid", http.StatusBadRequest)
+			return
+		}
+
+		var patch project
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &patch); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		existing, ok := m.projects[id]
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if patch.Parent != nil {
+			existing.Parent = patch.Parent
+		}
+		if patch.IsLatest {
+			existing.IsLatest = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(existing)
 	})
 
 	// POST /api/v1/bom — upload BOM
@@ -237,20 +277,20 @@ func TestEnsureProject_CreatesHierarchy(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create pipeline -> org -> app
-	uuid1, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	uuid1, err := client.ensureProject(logw, "pipeline", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("create pipeline: %v", err)
 	}
-	if uuid1 == "" {
-		t.Fatal("pipeline UUID is empty")
+	if uuid1 == uuid.Nil {
+		t.Fatal("pipeline UUID is nil")
 	}
 
-	uuid2, err := client.ensureProject(logw, "org", uuid1, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	uuid2, err := client.ensureProject(logw, "org", uuid1, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 
-	uuid3, err := client.ensureProject(logw, "app", uuid2, true, "v1", "APPLICATION", "")
+	uuid3, err := client.ensureProject(logw, "app", uuid2, true, "v1", "APPLICATION", "", false)
 	if err != nil {
 		t.Fatalf("create app: %v", err)
 	}
@@ -295,12 +335,12 @@ func TestEnsureProject_FindsExisting(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// First run — creates
-	uuid1, _ := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
-	uuid2, _ := client.ensureProject(logw, "app", uuid1, true, "v1", "APPLICATION", "")
+	uuid1, _ := client.ensureProject(logw, "pipeline", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
+	uuid2, _ := client.ensureProject(logw, "app", uuid1, true, "v1", "APPLICATION", "", false)
 
 	// Second run — should find existing
 	logw.Reset()
-	uuid1b, err := client.ensureProject(logw, "pipeline", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	uuid1b, err := client.ensureProject(logw, "pipeline", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("find pipeline: %v", err)
 	}
@@ -308,7 +348,7 @@ func TestEnsureProject_FindsExisting(t *testing.T) {
 		t.Errorf("pipeline UUID changed: %s -> %s", uuid1, uuid1b)
 	}
 
-	uuid2b, err := client.ensureProject(logw, "app", uuid1b, true, "v1", "APPLICATION", "")
+	uuid2b, err := client.ensureProject(logw, "app", uuid1b, true, "v1", "APPLICATION", "", false)
 	if err != nil {
 		t.Fatalf("find app: %v", err)
 	}
@@ -328,33 +368,89 @@ func TestEnsureProject_ConflictHandling(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create "myname" at root level
-	_, err := client.ensureProject(logw, "myname", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	_, err := client.ensureProject(logw, "myname", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("create root myname: %v", err)
 	}
 
 	// Create "parent"
-	parentUUID, err := client.ensureProject(logw, "parent", "", false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	parentUUID, err := client.ensureProject(logw, "parent", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
 	}
 
 	// Try to create "myname" under "parent" — should conflict then disambiguate
-	uuid, err := client.ensureProject(logw, "myname", parentUUID, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN")
+	id, err := client.ensureProject(logw, "myname", parentUUID, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
 	if err != nil {
 		t.Fatalf("create myname under parent: %v", err)
 	}
-	if uuid == "" {
-		t.Fatal("disambiguated UUID is empty")
+	if id == uuid.Nil {
+		t.Fatal("disambiguated UUID is nil")
 	}
 
 	// Verify the disambiguated project has the correct parent
 	mock.mu.Lock()
-	p := mock.projects[uuid]
+	p := mock.projects[id]
 	mock.mu.Unlock()
 
 	if p.Parent == nil || p.Parent.UUID != parentUUID {
 		t.Errorf("disambiguated parent = %v, want UUID %s", p.Parent, parentUUID)
+	}
+}
+
+func TestEnsureProject_SetsLatestOnCreate(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+	client := mock.client()
+	logw := &bytes.Buffer{}
+
+	id, err := client.ensureProject(logw, "my-app/source", uuid.Nil, true, "42", "APPLICATION", "", true)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	mock.mu.Lock()
+	p := mock.projects[id]
+	mock.mu.Unlock()
+
+	if !p.IsLatest {
+		t.Error("expected IsLatest=true on created project")
+	}
+}
+
+func TestEnsureProject_SetsLatestOnExisting(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+	client := mock.client()
+	logw := &bytes.Buffer{}
+
+	// Create without latest
+	id, _ := client.ensureProject(logw, "my-app/source", uuid.Nil, true, "42", "APPLICATION", "", false)
+
+	mock.mu.Lock()
+	if mock.projects[id].IsLatest {
+		t.Error("expected IsLatest=false initially")
+	}
+	mock.mu.Unlock()
+
+	// Re-run with latest=true — should PATCH the existing project
+	logw.Reset()
+	id2, err := client.ensureProject(logw, "my-app/source", uuid.Nil, true, "42", "APPLICATION", "", true)
+	if err != nil {
+		t.Fatalf("re-run with latest: %v", err)
+	}
+	if id2 != id {
+		t.Errorf("UUID changed: %s -> %s", id, id2)
+	}
+
+	mock.mu.Lock()
+	if !mock.projects[id].IsLatest {
+		t.Error("expected IsLatest=true after patch")
+	}
+	mock.mu.Unlock()
+
+	if !strings.Contains(logw.String(), "Marking project as latest") {
+		t.Error("expected 'Marking project as latest' in log output")
 	}
 }
 
@@ -370,7 +466,7 @@ func TestUploadBOM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	token, err := client.uploadBOM("some-uuid", tmpFile)
+	token, err := client.uploadBOM(uuid.New(), tmpFile)
 	if err != nil {
 		t.Fatalf("uploadBOM: %v", err)
 	}
@@ -384,7 +480,7 @@ func TestUploadBOM_FileNotFound(t *testing.T) {
 	defer mock.close()
 	client := mock.client()
 
-	_, err := client.uploadBOM("some-uuid", "/tmp/nonexistent-sbom.json")
+	_, err := client.uploadBOM(uuid.New(), "/tmp/nonexistent-sbom.json")
 	if err == nil {
 		t.Fatal("expected error for missing file")
 	}
@@ -397,11 +493,10 @@ func TestSetProjectTags(t *testing.T) {
 	logw := &bytes.Buffer{}
 
 	// Create a project first
-	uuid, _ := client.ensureProject(logw, "tagged-app", "", true, "v1", "APPLICATION", "")
+	id, _ := client.ensureProject(logw, "tagged-app", uuid.Nil, true, "v1", "APPLICATION", "", false)
 
-	// Set tags
 	tags := parseTags("origin:pipeline,team:platform")
-	err := client.setProjectTags(uuid, tags)
+	err := client.setProjectTags(id, tags)
 	if err != nil {
 		t.Fatalf("setProjectTags: %v", err)
 	}
@@ -419,13 +514,15 @@ func TestRun_FullIntegration(t *testing.T) {
 	}
 
 	cfg := &config{
-		BaseURL:        mock.server.URL,
-		APIKey:         "test-key",
-		ProjectPath:    "pipeline/my-org/my-app/source",
-		ProjectVersion: "42",
-		SBOMFile:       tmpFile,
-		Tags:           "origin:pipeline,team:test",
-		Classifier:     "APPLICATION",
+		BaseURL:             mock.server.URL,
+		APIKey:              "test-key",
+		ProjectPath:         "pipeline/my-org/my-app/source",
+		ProjectVersion:      "42",
+		SBOMFile:            tmpFile,
+		Tags:                "origin:pipeline,team:test",
+		Classifier:          "APPLICATION",
+		AggregateChildVulns: true,
+		Latest:              true,
 	}
 
 	logw := &bytes.Buffer{}
@@ -453,17 +550,20 @@ func TestRun_FullIntegration(t *testing.T) {
 		t.Errorf("expected 4 projects, got %d", count)
 	}
 
-	// Verify leaf project has qualified name (full path)
 	mock.mu.Lock()
-	var leafFound bool
+	var leaf *project
 	for _, p := range mock.projects {
 		if p.Name == "pipeline/my-org/my-app/source" && p.Version == "42" {
-			leafFound = true
+			leaf = p
 		}
 	}
 	mock.mu.Unlock()
-	if !leafFound {
-		t.Error("expected leaf project named 'pipeline/my-org/my-app/source' v42")
+
+	if leaf == nil {
+		t.Fatal("expected leaf project named 'pipeline/my-org/my-app/source' v42")
+	}
+	if !leaf.IsLatest {
+		t.Error("expected leaf to be marked as latest")
 	}
 
 	// Run again — should be idempotent
@@ -490,15 +590,16 @@ func TestRun_TwoLevelAppCentric(t *testing.T) {
 	tmpFile := filepath.Join(t.TempDir(), "test.cdx.json")
 	_ = os.WriteFile(tmpFile, []byte(sbom), 0o644)
 
-	// Simulate: dtrack-upload --project-path "my-app/source" --project-version 42
 	cfg := &config{
-		BaseURL:        mock.server.URL,
-		APIKey:         "test-key",
-		ProjectPath:    "my-app/source",
-		ProjectVersion: "42",
-		SBOMFile:       tmpFile,
-		Tags:           "origin:pipeline-source,app:my-app",
-		Classifier:     "APPLICATION",
+		BaseURL:             mock.server.URL,
+		APIKey:              "test-key",
+		ProjectPath:         "my-app/source",
+		ProjectVersion:      "42",
+		SBOMFile:            tmpFile,
+		Tags:                "origin:pipeline-source,app:my-app",
+		Classifier:          "APPLICATION",
+		AggregateChildVulns: true,
+		Latest:              true,
 	}
 
 	logw := &bytes.Buffer{}
@@ -506,15 +607,16 @@ func TestRun_TwoLevelAppCentric(t *testing.T) {
 		t.Fatalf("run source: %v\nlog: %s", err, logw.String())
 	}
 
-	// Also upload container SBOM
 	cfg2 := &config{
-		BaseURL:        mock.server.URL,
-		APIKey:         "test-key",
-		ProjectPath:    "my-app/container",
-		ProjectVersion: "42",
-		SBOMFile:       tmpFile,
-		Tags:           "origin:pipeline-container,app:my-app",
-		Classifier:     "APPLICATION",
+		BaseURL:             mock.server.URL,
+		APIKey:              "test-key",
+		ProjectPath:         "my-app/container",
+		ProjectVersion:      "42",
+		SBOMFile:            tmpFile,
+		Tags:                "origin:pipeline-container,app:my-app",
+		Classifier:          "APPLICATION",
+		AggregateChildVulns: true,
+		Latest:              true,
 	}
 
 	logw.Reset()
@@ -605,7 +707,6 @@ func TestRun_EmptyPath(t *testing.T) {
 }
 
 func TestParseFlags(t *testing.T) {
-	// All required flags
 	cfg, err := parseFlags([]string{
 		"--url", "https://dt.example.com",
 		"--api-key", "key123",
@@ -615,6 +716,8 @@ func TestParseFlags(t *testing.T) {
 		"--tags", "x:y",
 		"--classifier", "LIBRARY",
 		"--insecure",
+		"--aggregate-child-vulns=false",
+		"--latest=false",
 	})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -628,8 +731,32 @@ func TestParseFlags(t *testing.T) {
 	if !cfg.Insecure {
 		t.Error("Insecure should be true")
 	}
+	if cfg.AggregateChildVulns {
+		t.Error("AggregateChildVulns should be false when explicitly set")
+	}
+	if cfg.Latest {
+		t.Error("Latest should be false when explicitly set")
+	}
 
-	// Missing required
+	// Verify defaults
+	cfg2, err := parseFlags([]string{
+		"--url", "https://dt.example.com",
+		"--api-key", "key123",
+		"--project-path", "a/b",
+		"--project-version", "1",
+		"--sbom", "file.json",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags defaults: %v", err)
+	}
+	if !cfg2.AggregateChildVulns {
+		t.Error("AggregateChildVulns should default to true")
+	}
+	if !cfg2.Latest {
+		t.Error("Latest should default to true")
+	}
+
+	// Missing required flags
 	_, err = parseFlags([]string{"--url", "x"})
 	if err == nil {
 		t.Error("expected error for missing flags")
