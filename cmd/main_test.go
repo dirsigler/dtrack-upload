@@ -116,9 +116,13 @@ func newMockDT() *mockDT {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 
+		excludeInactive := r.URL.Query().Get("excludeInactive") == "true"
 		var results []project
 		for _, p := range m.projects {
 			if p.Name == name {
+				if excludeInactive && !p.Active {
+					continue
+				}
 				results = append(results, *p)
 			}
 		}
@@ -240,6 +244,9 @@ func newMockDT() *mockDT {
 		}
 		if patch.Parent != nil {
 			existing.Parent = patch.Parent
+		}
+		if patch.Active {
+			existing.Active = true
 		}
 		if patch.IsLatest {
 			existing.IsLatest = true
@@ -780,5 +787,45 @@ func TestParseFlags_EnvVars(t *testing.T) {
 	}
 	if cfg.APIKey != "env-key" {
 		t.Errorf("APIKey = %q, want from env", cfg.APIKey)
+	}
+}
+
+func TestEnsureProject_ReactivatesInactiveProject(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+	client := mock.client()
+	logw := &bytes.Buffer{}
+
+	// Pre-create an inactive root project (simulates a previously deactivated project)
+	inactiveUUID := uuid.New()
+	mock.mu.Lock()
+	mock.projects[inactiveUUID] = &project{
+		UUID:       inactiveUUID,
+		Name:       "app-mm-chat",
+		Active:     false,
+		Classifier: "APPLICATION",
+	}
+	mock.mu.Unlock()
+
+	// Attempt to create "app-mm-chat" as a root intermediate project.
+	// This should hit a 409, find the inactive project, and reactivate it.
+	gotUUID, err := client.ensureProject(logw, "app-mm-chat", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_DIRECT_CHILDREN", false)
+	if err != nil {
+		t.Fatalf("ensureProject failed: %v", err)
+	}
+	if gotUUID != inactiveUUID {
+		t.Errorf("expected UUID %s, got %s", inactiveUUID, gotUUID)
+	}
+
+	// Verify the project is now active
+	mock.mu.Lock()
+	p := mock.projects[inactiveUUID]
+	mock.mu.Unlock()
+	if !p.Active {
+		t.Error("project should be active after reactivation")
+	}
+
+	if !strings.Contains(logw.String(), "Reactivated") {
+		t.Errorf("expected log to contain 'Reactivated', got: %s", logw.String())
 	}
 }

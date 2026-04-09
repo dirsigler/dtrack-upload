@@ -337,10 +337,54 @@ func (c *dtClient) findByParent(logw io.Writer, name string, parentUUID uuid.UUI
 	return uuid.Nil, false
 }
 
+// findAndReactivate searches for an inactive project with the given name and parent,
+// reactivates it, and returns its UUID.
+func (c *dtClient) findAndReactivate(logw io.Writer, name string, parentUUID uuid.UUID, classifier, collectionLogic string) (uuid.UUID, bool) {
+	projects, err := c.searchProjectsAll(name)
+	if err != nil {
+		return uuid.Nil, false
+	}
+
+	for _, p := range projects {
+		if p.Active {
+			continue
+		}
+		full, err := c.fetchProject(p.UUID)
+		if err != nil {
+			continue
+		}
+		parentMatch := (parentUUID == uuid.Nil && full.Parent == nil) ||
+			(parentUUID != uuid.Nil && full.Parent != nil && full.Parent.UUID == parentUUID)
+		if !parentMatch {
+			continue
+		}
+		// Reactivate the project
+		full.Active = true
+		if classifier != "" {
+			full.Classifier = classifier
+		}
+		if collectionLogic != "" {
+			full.CollectionLogic = collectionLogic
+		}
+		if err := c.patchProject(full.UUID, full); err != nil {
+			fmt.Fprintf(logw, "Warning: failed to reactivate project %s: %v\n", name, err)
+			continue
+		}
+		fmt.Fprintf(logw, "Reactivated inactive project: %s (UUID: %s)\n", name, full.UUID)
+		return full.UUID, true
+	}
+	return uuid.Nil, false
+}
+
 // handleConflict resolves a 409 by finding the right project or creating a disambiguated one.
 func (c *dtClient) handleConflict(logw io.Writer, name string, parentUUID uuid.UUID, isLeaf bool, version, classifier, collectionLogic string, latest bool) (uuid.UUID, error) {
-	// Try to find one with matching parent
+	// Try to find one with matching parent (active projects)
 	if id, found := c.findByParent(logw, name, parentUUID); found {
+		return id, nil
+	}
+
+	// Check for inactive projects that match and reactivate them
+	if id, found := c.findAndReactivate(logw, name, parentUUID, classifier, collectionLogic); found {
 		return id, nil
 	}
 
@@ -388,8 +432,16 @@ func (c *dtClient) lookupProject(name, version string) (*project, error) {
 }
 
 func (c *dtClient) searchProjects(name string) ([]project, error) {
-	endpoint := fmt.Sprintf("%s/project?name=%s&excludeInactive=true&limit=500",
-		c.baseURL, url.QueryEscape(name))
+	return c.searchProjectsOpts(name, true)
+}
+
+func (c *dtClient) searchProjectsAll(name string) ([]project, error) {
+	return c.searchProjectsOpts(name, false)
+}
+
+func (c *dtClient) searchProjectsOpts(name string, excludeInactive bool) ([]project, error) {
+	endpoint := fmt.Sprintf("%s/project?name=%s&excludeInactive=%t&limit=500",
+		c.baseURL, url.QueryEscape(name), excludeInactive)
 
 	body, err := c.doRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
