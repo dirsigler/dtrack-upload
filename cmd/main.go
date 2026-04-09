@@ -140,7 +140,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.StringVar(&cfg.SBOMFile, "sbom", "", "Path to CycloneDX SBOM file")
 	fs.StringVar(&cfg.Tags, "tags", "", "Comma-separated tags for the leaf project (e.g. origin:pipeline,team:platform)")
 	fs.StringVar(&cfg.Classifier, "classifier", "APPLICATION", "DT project classifier (APPLICATION, LIBRARY, etc.)")
-	fs.BoolVar(&cfg.AggregateChildVulns, "aggregate-child-vulns", true, "Set parent projects to aggregate vulnerabilities from direct children")
+	fs.BoolVar(&cfg.AggregateChildVulns, "aggregate-child-vulns", true, "Set parent projects to aggregate vulnerabilities from direct children marked as latest version")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "Skip TLS certificate verification")
 	fs.BoolVar(&cfg.Latest, "latest", true, "Mark this project version as latest in Dependency Track")
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
@@ -182,7 +182,7 @@ func run(cfg *config, logw io.Writer) error {
 	client := newDTClient(cfg.BaseURL, cfg.APIKey, cfg.Insecure)
 
 	// Determine collection logic for parent projects.
-	collectionLogic := "AGGREGATE_DIRECT_CHILDREN"
+	collectionLogic := "AGGREGATE_LATEST_VERSION_CHILDREN"
 	if !cfg.AggregateChildVulns {
 		collectionLogic = "NONE"
 	}
