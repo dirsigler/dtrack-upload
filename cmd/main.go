@@ -53,6 +53,7 @@ type config struct {
 	AggregateChildVulns bool
 	Insecure            bool
 	Latest              bool
+	GC                  bool
 }
 
 // project represents a Dependency Track project.
@@ -143,6 +144,7 @@ func parseFlags(args []string) (*config, error) {
 	fs.BoolVar(&cfg.AggregateChildVulns, "aggregate-child-vulns", true, "Set parent projects to aggregate vulnerabilities from direct children marked as latest version")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "Skip TLS certificate verification")
 	fs.BoolVar(&cfg.Latest, "latest", true, "Mark this project version as latest in Dependency Track")
+	fs.BoolVar(&cfg.GC, "gc", true, "Deactivate old project versions after upload, keeping only the current version active")
 	fs.BoolVar(&showVersion, "version", false, "Print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -222,6 +224,17 @@ func run(cfg *config, logw io.Writer) error {
 		return fmt.Errorf("failed to upload SBOM: %w", err)
 	}
 	fmt.Fprintf(logw, "SBOM uploaded successfully (token: %s)\n", token)
+
+	// Garbage-collect old versions
+	if cfg.GC {
+		deactivated, err := client.deactivateOldVersions(logw, leafName, leafUUID)
+		if err != nil {
+			fmt.Fprintf(logw, "Warning: GC failed: %v\n", err)
+		} else if deactivated > 0 {
+			fmt.Fprintf(logw, "GC: deactivated %d old project version(s)\n", deactivated)
+		}
+	}
+
 	return nil
 }
 
@@ -495,6 +508,33 @@ func (c *dtClient) patchProject(id uuid.UUID, p *project) error {
 	}
 	_, err = c.doRequest(http.MethodPatch, fmt.Sprintf("%s/project/%s", c.baseURL, id), bytes.NewReader(payload))
 	return err
+}
+
+// deactivateOldVersions sets active=false on all active versions of a project
+// except the one identified by keepUUID.
+func (c *dtClient) deactivateOldVersions(logw io.Writer, name string, keepUUID uuid.UUID) (int, error) {
+	projects, err := c.searchProjects(name)
+	if err != nil {
+		return 0, fmt.Errorf("list projects: %w", err)
+	}
+
+	deactivated := 0
+	for _, p := range projects {
+		if p.UUID == keepUUID {
+			continue
+		}
+		// Only deactivate versioned projects (skip parent/hierarchy projects)
+		if p.Version == "" {
+			continue
+		}
+		fmt.Fprintf(logw, "GC: deactivating %s v%s (UUID: %s)\n", p.Name, p.Version, p.UUID)
+		if err := c.patchProject(p.UUID, &project{Active: false}); err != nil {
+			fmt.Fprintf(logw, "Warning: failed to deactivate %s v%s: %v\n", p.Name, p.Version, err)
+			continue
+		}
+		deactivated++
+	}
+	return deactivated, nil
 }
 
 func (c *dtClient) setProjectTags(projectUUID uuid.UUID, tags []tag) error {

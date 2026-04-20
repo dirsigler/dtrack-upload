@@ -227,9 +227,9 @@ func newMockDT() *mockDT {
 			return
 		}
 
-		var patch project
 		body, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(body, &patch); err != nil {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(body, &raw); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
@@ -242,14 +242,20 @@ func newMockDT() *mockDT {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		if patch.Parent != nil {
-			existing.Parent = patch.Parent
+		if v, ok := raw["parent"]; ok {
+			var parent *parentRef
+			_ = json.Unmarshal(v, &parent)
+			existing.Parent = parent
 		}
-		if patch.Active {
-			existing.Active = true
+		if v, ok := raw["active"]; ok {
+			var active bool
+			_ = json.Unmarshal(v, &active)
+			existing.Active = active
 		}
-		if patch.IsLatest {
-			existing.IsLatest = true
+		if v, ok := raw["isLatest"]; ok {
+			var latest bool
+			_ = json.Unmarshal(v, &latest)
+			existing.IsLatest = latest
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(existing)
@@ -827,5 +833,135 @@ func TestEnsureProject_ReactivatesInactiveProject(t *testing.T) {
 
 	if !strings.Contains(logw.String(), "Reactivated") {
 		t.Errorf("expected log to contain 'Reactivated', got: %s", logw.String())
+	}
+}
+
+func TestDeactivateOldVersions(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+	client := mock.client()
+	logw := &bytes.Buffer{}
+
+	// Create 3 versions of same project
+	var uuids [3]uuid.UUID
+	for i, ver := range []string{"40", "41", "42"} {
+		id, err := client.ensureProject(logw, "my-app/source", uuid.Nil, true, ver, "APPLICATION", "", i == 2)
+		if err != nil {
+			t.Fatalf("create v%s: %v", ver, err)
+		}
+		uuids[i] = id
+	}
+
+	// All 3 should be active
+	mock.mu.Lock()
+	for _, id := range uuids {
+		if !mock.projects[id].Active {
+			t.Fatalf("project %s should be active before GC", id)
+		}
+	}
+	mock.mu.Unlock()
+
+	// GC keeping only v42
+	deactivated, err := client.deactivateOldVersions(logw, "my-app/source", uuids[2])
+	if err != nil {
+		t.Fatalf("deactivateOldVersions: %v", err)
+	}
+	if deactivated != 2 {
+		t.Errorf("expected 2 deactivated, got %d", deactivated)
+	}
+
+	// v40 and v41 should be inactive, v42 still active
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if mock.projects[uuids[0]].Active {
+		t.Error("v40 should be inactive after GC")
+	}
+	if mock.projects[uuids[1]].Active {
+		t.Error("v41 should be inactive after GC")
+	}
+	if !mock.projects[uuids[2]].Active {
+		t.Error("v42 should still be active after GC")
+	}
+}
+
+func TestDeactivateOldVersions_SkipsParentProjects(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+	client := mock.client()
+	logw := &bytes.Buffer{}
+
+	// Create a parent (no version) and a leaf with same name prefix
+	parentID, err := client.ensureProject(logw, "my-app", uuid.Nil, false, "", "APPLICATION", "AGGREGATE_LATEST_VERSION_CHILDREN", false)
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+
+	leafID, err := client.ensureProject(logw, "my-app", uuid.Nil, true, "1", "APPLICATION", "", true)
+	if err != nil {
+		t.Fatalf("create leaf: %v", err)
+	}
+
+	deactivated, err := client.deactivateOldVersions(logw, "my-app", leafID)
+	if err != nil {
+		t.Fatalf("deactivateOldVersions: %v", err)
+	}
+	if deactivated != 0 {
+		t.Errorf("expected 0 deactivated (parent has no version), got %d", deactivated)
+	}
+
+	// Parent should still be active
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	if !mock.projects[parentID].Active {
+		t.Error("parent project should still be active")
+	}
+}
+
+func TestRun_GCDeactivatesOldVersions(t *testing.T) {
+	mock := newMockDT()
+	defer mock.close()
+
+	sbom := filepath.Join(t.TempDir(), "sbom.cdx.json")
+	_ = os.WriteFile(sbom, []byte(`{"bomFormat":"CycloneDX"}`), 0o644)
+
+	logw := &bytes.Buffer{}
+
+	// Run twice with different versions
+	for _, ver := range []string{"41", "42"} {
+		logw.Reset()
+		err := run(&config{
+			BaseURL:        mock.server.URL,
+			APIKey:         "test-key",
+			ProjectPath:    "my-app/source",
+			ProjectVersion: ver,
+			SBOMFile:       sbom,
+			Classifier:     "APPLICATION",
+			Latest:         true,
+			GC:             true,
+		}, logw)
+		if err != nil {
+			t.Fatalf("run v%s: %v", ver, err)
+		}
+	}
+
+	// After second run, v41 should be deactivated
+	if !strings.Contains(logw.String(), "GC: deactivating") {
+		t.Errorf("expected GC log, got: %s", logw.String())
+	}
+	if !strings.Contains(logw.String(), "deactivated 1 old") {
+		t.Errorf("expected 1 deactivated, got: %s", logw.String())
+	}
+
+	// Count active versioned projects named "my-app/source"
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	activeCount := 0
+	for _, p := range mock.projects {
+		if p.Name == "my-app/source" && p.Version != "" && p.Active {
+			activeCount++
+		}
+	}
+	if activeCount != 1 {
+		t.Errorf("expected 1 active versioned project, got %d", activeCount)
 	}
 }
